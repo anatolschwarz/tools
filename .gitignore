@@ -1,0 +1,7 @@
+# repo-wide cruft (per-tool .gitignore handles tool-specific assets/weights)
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.DS_Store
+Thumbs.db

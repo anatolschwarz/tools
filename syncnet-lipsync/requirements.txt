@@ -1,0 +1,13 @@
+# syncnet-lipsync dependencies (CPU-only), pinned to a known-good set.
+# torch / torchvision / torchaudio ship as CPU wheels from the PyTorch index;
+# the +cpu local version forces that build. The rest come from PyPI.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
+torchaudio==2.5.1+cpu
+numpy==2.4.4
+scipy==1.18.0
+opencv-contrib-python==4.13.0.92
+python_speech_features==0.6
+scenedetect==0.6.7.1
+tqdm==4.68.4
