@@ -7,8 +7,10 @@ nothing more. No SSH, no EOL translation, no pushing.
 
 ## Topology
 
-- The file is git-tracked under `ClaudeRoot/work/<PROJECT>/` or `ClaudeRoot/tools/`.
-  This clone is the working tree — every commit happens here (the **user** pushes).
+- The file lives under an **anchor root**: a git tree (`ClaudeRoot/work/<PROJECT>/` or
+  `ClaudeRoot/tools/`) or the non-git scratch `ClaudeRoot/_zbale_/`. For git anchors this
+  clone is the working tree — `commit` happens here (the **user** pushes). `_zbale_` is a
+  non-git staging area: `import`/`export` work, but `commit` does not apply.
 - The running copy is remote. Some access tool bridges it to a local **external**
   path: MobaXterm's `Downloads\MobaXterm\RemoteFiles\...` temp file (auto-scp's back
   on change while open), VS Code Remote-SSH, sshfs, WinSCP, scp/rsync, a network
@@ -18,13 +20,13 @@ nothing more. No SSH, no EOL translation, no pushing.
 
 ## Bindings
 
-Step one is always establishing the connection between the git side and the
+Step one is always establishing the connection between the anchor side and the
 external staging side. coedit stores these bindings in `~/.coedit/bindings`
-(tab-separated `name<TAB>external<TAB>git`) so paths live in the registry, not on
-the command line. A binding is valid only when **exactly one side is under a git
-root** (`work/` or `tools/`) and the other is outside all of them — that keeps one
-foot in the tracked tree and blocks arbitrary→arbitrary copies. `bind` figures out
-which side is which; order doesn't matter.
+(tab-separated `name<TAB>external<TAB>anchor`) so paths live in the registry, not on
+the command line. A binding is valid only when **exactly one side is under an anchor
+root** (`work/`, `tools/`, or `_zbale_`) and the other is outside all of them — that
+keeps one foot in a known tree and blocks arbitrary→arbitrary copies. `bind` figures
+out which side is which; order doesn't matter.
 
 Bindings are per-session in practice: the external staging path can change between
 sessions (e.g. MobaX temp ids), so re-`bind` when the user gives new paths. The
@@ -34,20 +36,22 @@ breaks an allow-list rule.
 ## Actions
 
 ```
-coedit bind    <a> <b> [name]   register/replace a binding (name defaults to git basename)
+coedit bind    <a> <b> [name]     register/replace a binding (name defaults to anchor basename)
 coedit unbind  <name>
-coedit list                     bindings + live state (in-sync / differ / external-missing)
-coedit import  <name>           external -> git   (pull the edit made elsewhere into the tracked file)
-coedit export  <name>           git -> external   (push my edit out; the access tool uploads it)
-coedit compare <name>           in-sync? else show the diff  (external=<  git=>)
-coedit commit  <name> <msg>     git add+commit the gitted side only — NEVER pushes
-coedit show    <name> [ext|git] print one side (default git)
+coedit list                       bindings + live state (in-sync / differ / external-missing)
+coedit import  <name>             external -> anchor  (pull the edit made elsewhere into the anchor file)
+coedit export  <name>             anchor -> external  (push my edit out; the access tool uploads it)
+coedit compare <name>             in-sync? else show the diff  (external=<  anchor=>)
+coedit commit  <name> <msg>       git add+commit the anchor side — git anchors only, NEVER pushes
+coedit show    <name> [ext|anchor] print one side (default anchor)
 ```
 
 Names match exactly, else by unique case-insensitive substring.
 
 `import`/`export`/`compare`/`show` are **not** git operations — don't describe them
 in git terms. `import` = the user's edit coming in; `export` = my edit going out.
+`commit` is the only git operation, and only for git anchors; on a `_zbale_` binding
+it refuses.
 
 ## Single-approval design
 
