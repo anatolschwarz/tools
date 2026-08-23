@@ -7,8 +7,8 @@ nothing more. No SSH, no EOL translation, no pushing.
 
 ## Topology
 
-- The file lives under an **anchor root**: a git tree (`ClaudeRoot/work/<PROJECT>/` or
-  `ClaudeRoot/tools/`) or the non-git scratch `ClaudeRoot/_zbale_/`. For git anchors this
+- The file lives under an **anchor root**: a git tree (`CodeRoot/work/<PROJECT>/` or
+  `CodeRoot/tools/`) or the non-git scratch `CodeRoot/_zbale_/`. For git anchors this
   clone is the working tree — `commit` happens here (the **user** pushes). `_zbale_` is a
   non-git staging area: `import`/`export` work, but `commit` does not apply.
 - The running copy is remote. Some access tool bridges it to a local **external**
@@ -58,7 +58,7 @@ it refuses.
 Every action fronts through this one script, so a single allow-list rule
 
 ```
-Bash(bash /mnt/c/Users/anatol.schwartz/ClaudeRoot/tools/coedit/coedit.sh:*)
+Bash(bash /home/anatolschwartz/CodeRoot/tools/coedit/coedit.sh:*)
 ```
 
 makes the whole workflow prompt-free. **Adding that rule is the user's decision** —

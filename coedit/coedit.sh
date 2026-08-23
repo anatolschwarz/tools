@@ -9,7 +9,7 @@
 # and the other is not.
 #
 # One command fronts every action, so a single allow-list rule
-#   Bash(bash /mnt/c/Users/anatol.schwartz/ClaudeRoot/tools/coedit/coedit.sh:*)
+#   Bash(bash /home/anatolschwartz/CodeRoot/tools/coedit/coedit.sh:*)
 # would make the whole workflow prompt-free. Paths live in the registry, not on
 # the command line, so a staging path that changes between sessions never breaks
 # that rule. (Adding the rule is the user's call — this script never touches settings.)
@@ -33,14 +33,14 @@
 set -euo pipefail
 
 GIT_ROOTS=(
-  "/mnt/c/Users/anatol.schwartz/ClaudeRoot/work"
-  "/mnt/c/Users/anatol.schwartz/ClaudeRoot/tools"
+  "/home/anatolschwartz/CodeRoot/work"
+  "/home/anatolschwartz/CodeRoot/tools"
 )
 # anchor roots = git roots + non-git scratch anchors. import/export/compare work on
 # any anchor; commit is gated to git roots only.
 ANCHOR_ROOTS=(
   "${GIT_ROOTS[@]}"
-  "/mnt/c/Users/anatol.schwartz/ClaudeRoot/_zbale_"
+  "/home/anatolschwartz/CodeRoot/_zbale_"
 )
 REG="${HOME}/.coedit/bindings"        # name<TAB>external<TAB>anchor per line
 
