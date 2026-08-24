@@ -149,18 +149,115 @@ That command performs the protected handoff-repository Git and network
 operations. Restart Codex after changing project configuration or user command
 rules.
 
-## Deferred provider setup documentation
+## GitHub publisher setup
 
-Research and document the current official setup requirements before treating
-provider integration documentation as complete:
+Keep the handoff repository private unless its response and diff artifacts are
+deliberately public. Use `main` as its default branch. The maintained tool
+requires its configured local handoff working tree to be on `main` and pushes
+`origin main` directly.
 
-- GitHub repository, deploy-key, access, and branch settings required for the
-  publishing side;
-- ChatGPT GitHub connection, repository selection, and required permissions;
-- Claude.ai GitHub connection, repository selection, and required permissions;
-- equivalent setup for any other handoff consumer;
-- least-privilege guidance for private repositories;
-- verification and troubleshooting steps for each provider.
+Create a dedicated SSH key pair for this handoff repository. In the repository
+on GitHub, open **Settings → Deploy keys → Add deploy key**, add only the public
+key, and select **Allow write access**. A deploy key is scoped to one repository
+and is read-only unless write access is explicitly enabled. Keep the private key
+outside every repository and configure the `github-prom-resp` SSH host alias to
+use it.
 
-Verify these requirements against each provider's current official
-documentation when this work is resumed. Do not fill them in from memory.
+Review branch protections and rulesets targeting `main`. They must permit the
+publisher's direct pushes; do not weaken unrelated repository protections.
+
+Official GitHub references:
+
+- [Managing deploy keys](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys)
+- [Testing an SSH connection](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/testing-your-ssh-connection)
+- [About rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets)
+
+### Publisher verification
+
+Test the configured SSH alias:
+
+```bash
+ssh -T git@github-prom-resp
+```
+
+GitHub's successful authentication message says that it does not provide shell
+access, and this test normally exits with status 1. Then verify repository read
+access without changing it:
+
+```bash
+git -C /home/anatolschwartz/CodeRoot/prom-resp-handoff ls-remote origin main
+```
+
+The definitive write test is a real `push-response.sh` handoff with a unique
+test session token. Treat the publisher as verified only after the command
+pushes successfully and both canonical artifacts appear on remote `main`.
+
+### Publisher troubleshooting
+
+- `Permission denied (publickey)`: run
+  `ssh -vT git@github-prom-resp`; confirm that the alias resolves to GitHub,
+  uses the `git` SSH user, and offers the dedicated private key. Confirm that
+  the matching public key remains installed on the handoff repository.
+- Read succeeds but push fails: confirm **Allow write access** is enabled for
+  the deploy key and inspect the rules applying to `main`.
+- Wrong repository or account: compare `git remote -v` with the configured
+  `anatolschwarz/prom-resp-handoff` remote before changing any credentials.
+
+## ChatGPT consumer setup
+
+The ChatGPT GitHub app is a read-only consumer: it can search and analyze
+repository content but cannot push code, updates, or pull requests.
+
+1. In ChatGPT, open **Settings → Apps** and select **GitHub**.
+2. Connect the app and complete GitHub authorization.
+3. On GitHub's repository-access page, choose selected repositories and grant
+   access to `anatolschwarz/prom-resp-handoff` only.
+4. If ChatGPT separately asks which repositories to sync, select the handoff
+   repository there as well. Sync selection improves retrieval but is separate
+   from GitHub repository authorization.
+
+Availability varies by ChatGPT plan and product surface. The official setup
+page does not enumerate the app's underlying GitHub permission scopes; review
+the permissions shown by GitHub during authorization and do not accept
+unexpected write access.
+
+Official references:
+
+- [Connecting GitHub to ChatGPT](https://help.openai.com/en/articles/11145903)
+- [Installing a third-party GitHub App](https://docs.github.com/en/apps/using-github-apps/installing-a-github-app-from-a-third-party)
+
+### Consumer verification
+
+Publish a handoff whose response and diff contain different unique markers.
+In ChatGPT, enable the GitHub app and ask it to retrieve each marker from the
+expected project-scoped paths on `anatolschwarz/prom-resp-handoff`. Verify that
+it identifies the response and diff artifacts separately and reports their
+contents accurately. This verifies consumption; it does not authorize ChatGPT
+to publish handoffs.
+
+### Consumer troubleshooting
+
+- Allow about five minutes after connecting or changing repository access.
+- In **Settings → Apps → GitHub**, use **Choose repositories** or
+  **Configure Repositories on GitHub** and confirm that the handoff repository
+  is selected.
+- If GitHub organization policy blocks the app, request approval from the
+  repository or organization administrator.
+- If the selected repository is still absent, search on GitHub for
+  `repo:anatolschwarz/prom-resp-handoff import`, then allow 5–10 minutes for
+  GitHub's search index to update.
+- If the app is available in Deep Research or agent mode but not normal chat,
+  check the current plan and product-surface availability.
+
+## Least-privilege model
+
+- Only the publisher side has write access, through the repository-scoped
+  deploy key. Codex exposes that publisher path only through the approved
+  `push-response.sh` command.
+- ChatGPT receives read-only access through its GitHub app, limited to the
+  handoff repository.
+- Do not give ChatGPT the publisher's deploy key, a personal access token, the
+  local handoff path, or access to calling source repositories.
+- Do not select all private repositories when authorizing the consumer.
+- Remove unused app access and deploy keys. If the publisher's private key is
+  exposed, replace it and remove the compromised deploy key immediately.
