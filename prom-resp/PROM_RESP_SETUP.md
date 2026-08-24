@@ -148,3 +148,19 @@ The approved command rule should allow only the maintained executable:
 That command performs the protected handoff-repository Git and network
 operations. Restart Codex after changing project configuration or user command
 rules.
+
+## Deferred provider setup documentation
+
+Research and document the current official setup requirements before treating
+provider integration documentation as complete:
+
+- GitHub repository, deploy-key, access, and branch settings required for the
+  publishing side;
+- ChatGPT GitHub connection, repository selection, and required permissions;
+- Claude.ai GitHub connection, repository selection, and required permissions;
+- equivalent setup for any other handoff consumer;
+- least-privilege guidance for private repositories;
+- verification and troubleshooting steps for each provider.
+
+Verify these requirements against each provider's current official
+documentation when this work is resumed. Do not fill them in from memory.
