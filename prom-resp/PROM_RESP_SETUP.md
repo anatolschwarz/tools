@@ -4,7 +4,7 @@
 
 - Maintained tool: `/home/anatolschwartz/CodeRoot/tools/prom-resp`
 - Local handoff repository: `/home/anatolschwartz/CodeRoot/prom-resp-handoff`
-- Handoff remote: `git@github-prom-resp:anatolschwartz/prom-resp.git`
+- Handoff remote: `git@github-prom-resp:anatolschwarz/prom-resp-handoff.git`
 
 The calling Codex session generates response and diff artifacts in its own Git
 project or under `/tmp`. It passes those source paths to the maintained tool.
