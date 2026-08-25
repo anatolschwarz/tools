@@ -16,7 +16,7 @@ nothing more. No SSH, no EOL translation, no pushing.
   on change while open), VS Code Remote-SSH, sshfs, WinSCP, scp/rsync, a network
   share — coedit does not care which. It only copies to/from the external path;
   getting that path to the remote is the access tool's job.
-- Claude never touches the remote directly.
+- The editing agent does not touch the remote directly.
 
 ## Bindings
 
@@ -53,21 +53,25 @@ in git terms. `import` = the user's edit coming in; `export` = my edit going out
 `commit` is the only git operation, and only for git anchors; on a `_zbale_` binding
 it refuses.
 
-## Single-approval design
+## Scoped-approval design
 
-Every action fronts through this one script, so a single allow-list rule
+Every action fronts through the fixed command prefix
 
 ```
-Bash(bash /home/anatolschwartz/CodeRoot/tools/coedit/coedit.sh:*)
+bash /home/anatolschwartz/CodeRoot/tools/coedit/coedit.sh
 ```
 
-makes the whole workflow prompt-free. **Adding that rule is the user's decision** —
-this script never edits `settings.local.json`.
+An agent or client can grant one persistent, scoped approval for that prefix.
+Permission configuration is client-specific and is not managed by coedit.
+
+Registry initialization is guarded. When `~/.coedit/bindings` already exists,
+read actions do not open it for writing. If it does not exist, the first invocation
+creates it.
 
 ## EOL
 
 Copies are byte-for-byte; coedit does no EOL processing. The chain is LF end-to-end
-(editors save LF on the Linux remote; Claude writes LF). A repo `.gitattributes`
+(editors save LF on the Linux remote; agents write LF). A repo `.gitattributes`
 forcing LF is only a commit-time backstop for a stray Windows-side checkout — dormant
 in normal use.
 

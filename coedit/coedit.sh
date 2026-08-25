@@ -8,11 +8,12 @@
 # copy; it only requires that exactly one side of a binding is under an anchor root
 # and the other is not.
 #
-# One command fronts every action, so a single allow-list rule
-#   Bash(bash /home/anatolschwartz/CodeRoot/tools/coedit/coedit.sh:*)
-# would make the whole workflow prompt-free. Paths live in the registry, not on
-# the command line, so a staging path that changes between sessions never breaks
-# that rule. (Adding the rule is the user's call — this script never touches settings.)
+# One command fronts every action, so clients can grant a single scoped approval
+# for:
+#   bash /home/anatolschwartz/CodeRoot/tools/coedit/coedit.sh
+# Paths live in the registry, not on the command line, so a staging path that
+# changes between sessions does not affect that approval. Permission setup is
+# client-specific; this script never edits it.
 #
 # Actions:
 #   bind    <a> <b> [name]     register/replace a binding (one side under an anchor root,
@@ -44,7 +45,10 @@ ANCHOR_ROOTS=(
 )
 REG="${HOME}/.coedit/bindings"        # name<TAB>external<TAB>anchor per line
 
-mkdir -p "$(dirname "$REG")"; : >> "$REG"
+if [[ ! -f $REG ]]; then
+  mkdir -p "$(dirname "$REG")"
+  : > "$REG"
+fi
 
 die() { echo "coedit: $*" >&2; exit 1; }
 
