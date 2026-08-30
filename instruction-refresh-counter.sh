@@ -71,13 +71,28 @@ if [[ $refresh_mode == turns && -n $token_log_override ]]; then
   exit 2
 fi
 
-refresh_session_id=${CODEX_SESSION_ID:-}
-if [[ -z $refresh_session_id ]]; then
-  echo "error: CODEX_SESSION_ID is not set" >&2
+refresh_platform=""
+refresh_session_id=""
+if [[ -n ${CODEX_SESSION_ID:-} && -n ${CLAUDE_CODE_SESSION_ID:-} ]]; then
+  echo "error: multiple platform session IDs are set; cannot determine the current platform" >&2
+  exit 2
+elif [[ -n ${CODEX_SESSION_ID:-} ]]; then
+  refresh_platform=codex
+  refresh_session_id=$CODEX_SESSION_ID
+elif [[ -n ${CLAUDE_CODE_SESSION_ID:-} ]]; then
+  refresh_platform=claude
+  refresh_session_id=$CLAUDE_CODE_SESSION_ID
+else
+  echo "error: no supported platform session ID is available" >&2
   exit 2
 fi
 if [[ ! $refresh_session_id =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "error: CODEX_SESSION_ID contains unsupported characters" >&2
+  echo "error: platform session ID contains unsupported characters" >&2
+  exit 2
+fi
+
+if [[ $refresh_mode == tokens && $refresh_platform != codex ]]; then
+  echo "error: tokens mode is not supported on $refresh_platform" >&2
   exit 2
 fi
 
@@ -87,7 +102,7 @@ refresh_state_directory=${state_directory_override:-${INSTRUCTION_REFRESH_STATE_
 umask 077
 mkdir -p -- "$refresh_state_directory"
 refresh_state_directory=$(cd -- "$refresh_state_directory" && pwd -P)
-refresh_state_file="$refresh_state_directory/.codex-session-state-$refresh_session_id.json"
+refresh_state_file="$refresh_state_directory/${refresh_platform}-session-state-$refresh_session_id.json"
 
 exec {refresh_lock_fd}<"$refresh_state_directory"
 flock -x "$refresh_lock_fd"
