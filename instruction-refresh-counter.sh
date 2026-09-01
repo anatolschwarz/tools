@@ -2,7 +2,34 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: instruction-refresh-counter.sh --mode turns|tokens --threshold N [--reset] [--log-file PATH] [--state-dir PATH]" >&2
+  echo "usage: instruction-refresh-counter.sh --mode turns|tokens --threshold N --instruction-file PATH[,PATH...] [--show-status] [--reset] [--log-file PATH] [--state-dir PATH]" >&2
+}
+
+show_help() {
+  cat <<'EOF'
+usage: instruction-refresh-counter.sh --mode turns|tokens --threshold N --instruction-file PATH[,PATH...] [options]
+
+Required for normal operation:
+  --mode turns|tokens      Select the active refresh trigger.
+  --threshold N            Set the active mode's positive threshold.
+  --instruction-file PATH[,PATH...]
+                            Return these files in order when the threshold is reached.
+
+Options:
+  --show-status             Return status even when no refresh occurs.
+  --reset                   Reset both counters without reading instructions.
+  --log-file PATH           Override the platform session JSONL in tokens mode.
+  --state-dir PATH          Override the session-state directory.
+  --help                    Show this help.
+
+Output protocol:
+  Normal operation is silent unless --show-status is used.
+  A refresh returns a status line followed by:
+    --- BEGIN INSTRUCTION REFRESH ---
+    <instruction-file contents>
+    --- END INSTRUCTION REFRESH ---
+  A successful refresh resets both counters. A file-read failure resets neither.
+EOF
 }
 
 default_turn_threshold=20
@@ -10,8 +37,12 @@ default_token_threshold=50000
 refresh_mode=""
 active_threshold=""
 reset_counter=false
+show_status=false
 token_log_override=""
 state_directory_override=""
+instruction_file=""
+script_directory=""
+token_helper_file=""
 
 while (($# > 0)); do
   case "$1" in
@@ -35,6 +66,18 @@ while (($# > 0)); do
       reset_counter=true
       shift
       ;;
+    --instruction-file)
+      if (($# < 2)); then
+        usage
+        exit 2
+      fi
+      instruction_file=$2
+      shift 2
+      ;;
+    --show-status)
+      show_status=true
+      shift
+      ;;
     --log-file)
       if (($# < 2)); then
         usage
@@ -50,6 +93,10 @@ while (($# > 0)); do
       fi
       state_directory_override=$2
       shift 2
+      ;;
+    --help)
+      show_help
+      exit 0
       ;;
     *)
       usage
@@ -68,6 +115,10 @@ if [[ ! $active_threshold =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ $refresh_mode == turns && -n $token_log_override ]]; then
   echo "error: --log-file is valid only in tokens mode" >&2
+  exit 2
+fi
+if ! $reset_counter && [[ -z $instruction_file ]]; then
+  echo "error: --instruction-file is required for normal operation" >&2
   exit 2
 fi
 
@@ -91,11 +142,6 @@ if [[ ! $refresh_session_id =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 2
 fi
 
-if [[ $refresh_mode == tokens && $refresh_platform != codex ]]; then
-  echo "error: tokens mode is not supported on $refresh_platform" >&2
-  exit 2
-fi
-
 default_state_directory=/tmp/instruction-refresh
 refresh_state_directory=${state_directory_override:-${INSTRUCTION_REFRESH_STATE_DIR:-$default_state_directory}}
 
@@ -113,9 +159,8 @@ stored_turn_counter=""
 stored_turn_threshold=""
 stored_token_counter=""
 stored_token_threshold=""
-stored_log_offset=""
+stored_token_cursor_b64=""
 stored_log_file_b64=""
-legacy_counter=""
 state_status=""
 
 if [[ -f $refresh_state_file ]]; then
@@ -125,9 +170,8 @@ if [[ -f $refresh_state_file ]]; then
   stored_turn_threshold=$(sed -n 's/.*"turn_threshold": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
   stored_token_counter=$(sed -n 's/.*"token_counter": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
   stored_token_threshold=$(sed -n 's/.*"token_threshold": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
-  stored_log_offset=$(sed -n 's/.*"log_offset": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
+  stored_token_cursor_b64=$(sed -n 's/.*"token_cursor_b64": "\([^"]*\)".*/\1/p' "$refresh_state_file" | head -n 1)
   stored_log_file_b64=$(sed -n 's/.*"log_file_b64": "\([^"]*\)".*/\1/p' "$refresh_state_file" | head -n 1)
-  legacy_counter=$(sed -n 's/.*"counter": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
 fi
 
 if [[ ! -f $refresh_state_file ]]; then
@@ -137,30 +181,16 @@ if [[ ! -f $refresh_state_file ]]; then
   stored_turn_threshold=$default_turn_threshold
   stored_token_counter=0
   stored_token_threshold=$default_token_threshold
-  stored_log_offset=0
+  stored_token_cursor_b64=""
   stored_log_file_b64=""
   state_status=" state=initialized"
 elif [[ $stored_session_id == "$refresh_session_id" && $stored_mode == turns && $stored_turn_counter =~ ^[0-9]+$ && $stored_turn_threshold =~ ^[1-9][0-9]*$ ]]; then
   stored_token_counter=0
   stored_token_threshold=$default_token_threshold
-  stored_log_offset=0
+  stored_token_cursor_b64=""
   stored_log_file_b64=""
-elif [[ $stored_session_id == "$refresh_session_id" && $stored_mode == tokens && $stored_turn_counter =~ ^[0-9]+$ && $stored_turn_threshold =~ ^[1-9][0-9]*$ && $stored_token_counter =~ ^[0-9]+$ && $stored_token_threshold =~ ^[1-9][0-9]*$ && $stored_log_offset =~ ^[0-9]+$ ]]; then
+elif [[ $stored_session_id == "$refresh_session_id" && $stored_mode == tokens && $stored_turn_counter =~ ^[0-9]+$ && $stored_turn_threshold =~ ^[1-9][0-9]*$ && $stored_token_counter =~ ^[0-9]+$ && $stored_token_threshold =~ ^[1-9][0-9]*$ && -n $stored_token_cursor_b64 && -n $stored_log_file_b64 ]]; then
   :
-elif [[ $stored_session_id == "$refresh_session_id" && $stored_mode =~ ^(turns|tokens)$ && $legacy_counter =~ ^[0-9]+$ ]]; then
-  stored_turn_counter=0
-  stored_turn_threshold=$default_turn_threshold
-  stored_token_counter=0
-  stored_token_threshold=$default_token_threshold
-  if [[ $stored_mode == turns ]]; then
-    stored_turn_counter=$legacy_counter
-  else
-    stored_token_counter=$legacy_counter
-  fi
-  if [[ ! $stored_log_offset =~ ^[0-9]+$ ]]; then
-    stored_log_offset=0
-  fi
-  state_status=" state=migrated"
 else
   stored_session_id=$refresh_session_id
   stored_mode=$refresh_mode
@@ -168,7 +198,7 @@ else
   stored_turn_threshold=$default_turn_threshold
   stored_token_counter=0
   stored_token_threshold=$default_token_threshold
-  stored_log_offset=0
+  stored_token_cursor_b64=""
   stored_log_file_b64=""
   state_status=" state=restarted"
 fi
@@ -177,7 +207,7 @@ turn_counter=$stored_turn_counter
 turn_threshold=$stored_turn_threshold
 token_counter=$stored_token_counter
 token_threshold=$stored_token_threshold
-log_offset=$stored_log_offset
+token_cursor_b64=$stored_token_cursor_b64
 log_file_b64=$stored_log_file_b64
 previous_mode=$stored_mode
 
@@ -188,7 +218,6 @@ else
 fi
 
 token_log_file=""
-token_log_size=0
 resolved_log_file_b64=""
 
 find_token_log() {
@@ -207,10 +236,12 @@ find_token_log() {
     matching_logs=()
     if [[ -n ${INSTRUCTION_REFRESH_SESSIONS_DIR:-} ]]; then
       sessions_directory=$INSTRUCTION_REFRESH_SESSIONS_DIR
-    elif [[ -n ${CODEX_HOME:-} ]]; then
+    elif [[ $refresh_platform == codex && -n ${CODEX_HOME:-} ]]; then
       sessions_directory=$CODEX_HOME/sessions
-    elif [[ -n ${HOME:-} ]]; then
+    elif [[ $refresh_platform == codex && -n ${HOME:-} ]]; then
       sessions_directory=$HOME/.codex/sessions
+    elif [[ $refresh_platform == claude && -n ${HOME:-} ]]; then
+      sessions_directory=$HOME/.claude/projects
     else
       echo "error: cannot locate the sessions directory" >&2
       exit 2
@@ -221,9 +252,15 @@ find_token_log() {
       exit 2
     fi
 
-    mapfile -d '' matching_logs < <(
-      find "$sessions_directory" -type f -name "*$refresh_session_id*.jsonl" -print0
-    )
+    if [[ $refresh_platform == codex ]]; then
+      mapfile -d '' matching_logs < <(
+        find "$sessions_directory" -type f -name "*$refresh_session_id*.jsonl" -print0
+      )
+    else
+      mapfile -d '' matching_logs < <(
+        find "$sessions_directory" -type f -name "$refresh_session_id.jsonl" -print0
+      )
+    fi
     if ((${#matching_logs[@]} == 0)); then
       echo "error: no session JSONL found for $refresh_session_id" >&2
       exit 2
@@ -239,18 +276,109 @@ find_token_log() {
     echo "error: token log is not a readable file: $token_log_file" >&2
     exit 2
   fi
-  token_log_size=$(stat -c %s -- "$token_log_file")
   resolved_log_file_b64=$(printf '%s' "$token_log_file" | base64 --wrap=0)
 }
 
-if $reset_counter; then
-  if [[ $refresh_mode == turns ]]; then
-    turn_counter=0
-  else
-    find_token_log
+require_token_helper() {
+  if [[ -z $token_helper_file ]]; then
+    script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+    token_helper_file="$script_directory/instruction-refresh-token-count.py"
+  fi
+  if [[ ! -f $token_helper_file || ! -r $token_helper_file ]]; then
+    echo "error: token helper is not readable: $token_helper_file" >&2
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "error: python3 is required for token counting" >&2
+    exit 1
+  fi
+}
+
+parse_token_helper_output() {
+  helper_output=$1
+
+  if [[ $helper_output == *$'\n'* ]]; then
+    echo "error: token helper returned multiple output lines" >&2
+    exit 1
+  fi
+
+  helper_protocol=""
+  helper_token_delta=""
+  helper_event_count=""
+  helper_next_cursor_b64=""
+  helper_status=""
+  helper_extra=""
+  read -r helper_protocol helper_token_delta helper_event_count \
+    helper_next_cursor_b64 helper_status helper_extra <<<"$helper_output"
+
+  if [[ $helper_protocol != v1 \
+        || ! $helper_token_delta =~ ^[0-9]+$ \
+        || ! $helper_event_count =~ ^[0-9]+$ \
+        || ! $helper_next_cursor_b64 =~ ^[A-Za-z0-9_-]+={0,2}$ \
+        || ! $helper_status =~ ^(anchored|ok|restarted|compacted)$ \
+        || -n $helper_extra ]]; then
+    echo "error: token helper returned invalid output" >&2
+    exit 1
+  fi
+}
+
+anchor_token_log() {
+  require_token_helper
+  helper_output=""
+  if ! helper_output=$(
+    python3 "$token_helper_file" anchor \
+      --platform "$refresh_platform" \
+      --log-file "$token_log_file"
+  ); then
+    exit 1
+  fi
+  parse_token_helper_output "$helper_output"
+
+  if [[ $helper_status != anchored \
+        || $helper_token_delta != 0 \
+        || $helper_event_count != 0 ]]; then
+    echo "error: token helper returned an invalid anchor result" >&2
+    exit 1
+  fi
+  token_cursor_b64=$helper_next_cursor_b64
+}
+
+scan_token_log() {
+  require_token_helper
+  helper_output=""
+  if ! helper_output=$(
+    python3 "$token_helper_file" scan \
+      --platform "$refresh_platform" \
+      --log-file "$token_log_file" \
+      --cursor "$token_cursor_b64"
+  ); then
+    exit 1
+  fi
+  parse_token_helper_output "$helper_output"
+
+  if [[ $helper_status == anchored ]]; then
+    echo "error: token helper returned an anchor result for a scan" >&2
+    exit 1
+  fi
+
+  if [[ $helper_status == restarted ]]; then
     token_counter=0
-    log_offset=$token_log_size
+    state_status=" state=restarted"
+  elif [[ $helper_status == compacted ]]; then
+    token_counter=0
+    state_status=" state=compacted"
+  fi
+  token_counter=$((token_counter + helper_token_delta))
+  token_cursor_b64=$helper_next_cursor_b64
+}
+
+if $reset_counter; then
+  turn_counter=0
+  token_counter=0
+  if [[ $refresh_mode == tokens ]]; then
+    find_token_log
     log_file_b64=$resolved_log_file_b64
+    anchor_token_log
   fi
   state_status=" state=reset"
 else
@@ -262,35 +390,14 @@ else
     find_token_log
     log_file_b64=$resolved_log_file_b64
 
-    if [[ $previous_mode != tokens ]]; then
+    if [[ $previous_mode != tokens || -z $token_cursor_b64 ]]; then
       token_counter=0
-      log_offset=$token_log_size
-      state_status=" state=mode-changed"
-    elif ((log_offset > token_log_size)); then
-      token_counter=0
-      log_offset=$token_log_size
-      state_status=" state=restarted"
-    else
-      unread_byte_count=$((token_log_size - log_offset))
-      if ((unread_byte_count > 0)); then
-        token_event_count=$(
-          dd if="$token_log_file" iflag=skip_bytes,count_bytes skip="$log_offset" count="$unread_byte_count" status=none |
-            grep -c '"type":"token_count"' || true
-        )
-        read -r token_delta parsed_event_count < <(
-          dd if="$token_log_file" iflag=skip_bytes,count_bytes skip="$log_offset" count="$unread_byte_count" status=none |
-            sed -nE '/"type":"token_count"/ s/.*"last_token_usage":\{"input_tokens":([0-9]+),"cached_input_tokens":([0-9]+),"cache_write_input_tokens":[0-9]+,"output_tokens":([0-9]+).*/\1 \2 \3/p' |
-            awk '{ delta += $1 - $2 + $3; parsed += 1 } END { printf "%d %d\n", delta, parsed }'
-        )
-
-        if [[ $token_event_count != "$parsed_event_count" ]]; then
-          echo "error: an unrecognized token_count event was encountered" >&2
-          exit 1
-        fi
-
-        token_counter=$((token_counter + token_delta))
-        log_offset=$token_log_size
+      anchor_token_log
+      if [[ $previous_mode != tokens ]]; then
+        state_status=" state=mode-changed"
       fi
+    else
+      scan_token_log
     fi
   fi
 fi
@@ -301,6 +408,41 @@ if [[ $refresh_mode == turns && $turn_counter -ge $turn_threshold ]]; then
   refresh_required=yes
 elif [[ $refresh_mode == tokens && $token_counter -ge $token_threshold ]]; then
   refresh_required=yes
+fi
+
+instruction_contents=""
+instruction_file_resolved=""
+refresh_completed=no
+if [[ $refresh_required == yes ]]; then
+  if [[ $instruction_file == ,* || $instruction_file == *, || $instruction_file == *,,* ]]; then
+    echo "error: instruction file list contains an empty path" >&2
+    exit 1
+  fi
+  IFS=',' read -r -a instruction_files <<<"$instruction_file"
+  for instruction_file_entry in "${instruction_files[@]}"; do
+    if [[ ! -f $instruction_file_entry || ! -r $instruction_file_entry ]]; then
+      echo "error: instruction file is not readable: $instruction_file_entry" >&2
+      exit 1
+    fi
+    instruction_file_resolved=$(realpath -- "$instruction_file_entry")
+    current_instruction_contents=$(<"$instruction_file_resolved")
+    if [[ -z $current_instruction_contents ]]; then
+      echo "error: instruction file is empty: $instruction_file_resolved" >&2
+      exit 1
+    fi
+    if [[ -n $instruction_contents ]]; then
+      instruction_contents+=$'\n'
+    fi
+    instruction_contents+=$current_instruction_contents
+  done
+
+  refresh_completed=yes
+  turn_counter=0
+  token_counter=0
+  if [[ $refresh_mode == tokens ]]; then
+    anchor_token_log
+  fi
+  state_status=" state=reset"
 fi
 
 umask 077
@@ -316,14 +458,22 @@ if [[ $refresh_mode == turns ]]; then
   printf '{\n  "session_id": "%s",\n  "mode": "turns",\n  "turn_counter": %d,\n  "turn_threshold": %d\n}\n' \
     "$refresh_session_id" "$turn_counter" "$turn_threshold" >"$temporary_state_file"
 else
-  printf '{\n  "session_id": "%s",\n  "mode": "tokens",\n  "turn_counter": %d,\n  "turn_threshold": %d,\n  "token_counter": %d,\n  "token_threshold": %d,\n  "log_offset": %d,\n  "log_file_b64": "%s"\n}\n' \
-    "$refresh_session_id" "$turn_counter" "$turn_threshold" "$token_counter" "$token_threshold" "$log_offset" "$log_file_b64" >"$temporary_state_file"
+  printf '{\n  "session_id": "%s",\n  "mode": "tokens",\n  "turn_counter": %d,\n  "turn_threshold": %d,\n  "token_counter": %d,\n  "token_threshold": %d,\n  "token_cursor_b64": "%s",\n  "log_file_b64": "%s"\n}\n' \
+    "$refresh_session_id" "$turn_counter" "$turn_threshold" "$token_counter" "$token_threshold" "$token_cursor_b64" "$log_file_b64" >"$temporary_state_file"
 fi
 mv -f -- "$temporary_state_file" "$refresh_state_file"
 temporary_state_file=""
 
-if [[ $refresh_mode == turns ]]; then
-  echo "turns=$turn_counter/$turn_threshold trigger=turns refresh=$refresh_required$state_status"
-else
-  echo "turns=$turn_counter/$turn_threshold tokens=$token_counter/$token_threshold trigger=tokens refresh=$refresh_required$state_status"
+if $show_status || [[ $refresh_completed == yes ]]; then
+  if [[ $refresh_mode == turns ]]; then
+    echo "turns=$turn_counter/$turn_threshold trigger=turns refresh=$refresh_required$state_status"
+  else
+    echo "turns=$turn_counter/$turn_threshold tokens=$token_counter/$token_threshold trigger=tokens refresh=$refresh_required$state_status"
+  fi
+fi
+
+if [[ $refresh_completed == yes ]]; then
+  echo "--- BEGIN INSTRUCTION REFRESH ---"
+  printf '%s\n' "$instruction_contents"
+  echo "--- END INSTRUCTION REFRESH ---"
 fi
