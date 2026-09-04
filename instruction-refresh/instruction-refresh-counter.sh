@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: instruction-refresh-counter.sh --mode turns|tokens --threshold N --instruction-file PATH[,PATH...] [--show-status] [--reset] [--log-file PATH] [--state-dir PATH]" >&2
+  echo "usage: instruction-refresh-counter.sh --mode turns|tokens --threshold N --instruction-file PATH[,PATH...] [--show-status] [--reset] [--reset-occupancy] [--log-file PATH] [--state-dir PATH]" >&2
 }
 
 show_help() {
@@ -18,6 +18,7 @@ Required for normal operation:
 Options:
   --show-status             Return status even when no refresh occurs.
   --reset                   Reset both counters without reading instructions.
+  --reset-occupancy         Reset only context-occupancy max-turn-burn data.
   --log-file PATH           Override the platform session JSONL in tokens mode.
   --state-dir PATH          Override the session-state directory.
   --help                    Show this help.
@@ -34,14 +35,16 @@ EOF
 
 default_turn_threshold=20
 default_token_threshold=50000
+occupancy_state_version=1
 refresh_mode=""
 active_threshold=""
 reset_counter=false
+reset_occupancy=false
 show_status=false
 token_log_override=""
 state_directory_override=""
 instruction_file=""
-script_directory=""
+script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 token_helper_file=""
 
 while (($# > 0)); do
@@ -64,6 +67,10 @@ while (($# > 0)); do
       ;;
     --reset)
       reset_counter=true
+      shift
+      ;;
+    --reset-occupancy)
+      reset_occupancy=true
       shift
       ;;
     --instruction-file)
@@ -117,6 +124,14 @@ if [[ $refresh_mode == turns && -n $token_log_override ]]; then
   echo "error: --log-file is valid only in tokens mode" >&2
   exit 2
 fi
+if $reset_occupancy && [[ $refresh_mode != tokens ]]; then
+  echo "error: --reset-occupancy requires tokens mode" >&2
+  exit 2
+fi
+if $reset_counter && $reset_occupancy; then
+  echo "error: --reset and --reset-occupancy cannot be combined" >&2
+  exit 2
+fi
 if ! $reset_counter && [[ -z $instruction_file ]]; then
   echo "error: --instruction-file is required for normal operation" >&2
   exit 2
@@ -135,6 +150,10 @@ elif [[ -n ${CLAUDE_CODE_SESSION_ID:-} ]]; then
   refresh_session_id=$CLAUDE_CODE_SESSION_ID
 else
   echo "error: no supported platform session ID is available" >&2
+  exit 2
+fi
+if $reset_occupancy && [[ $refresh_platform != codex ]]; then
+  echo "error: --reset-occupancy requires a Codex session" >&2
   exit 2
 fi
 if [[ ! $refresh_session_id =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -161,6 +180,13 @@ stored_token_counter=""
 stored_token_threshold=""
 stored_token_cursor_b64=""
 stored_log_file_b64=""
+stored_occupancy_schema_version=""
+stored_occupancy_used_tokens=""
+stored_occupancy_context_window=""
+stored_occupancy_max_turn_burn=""
+stored_occupancy_last_completed_turn_tokens=""
+stored_occupancy_projected_usage=""
+stored_occupancy_would_trigger=""
 state_status=""
 
 if [[ -f $refresh_state_file ]]; then
@@ -172,6 +198,19 @@ if [[ -f $refresh_state_file ]]; then
   stored_token_threshold=$(sed -n 's/.*"token_threshold": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
   stored_token_cursor_b64=$(sed -n 's/.*"token_cursor_b64": "\([^"]*\)".*/\1/p' "$refresh_state_file" | head -n 1)
   stored_log_file_b64=$(sed -n 's/.*"log_file_b64": "\([^"]*\)".*/\1/p' "$refresh_state_file" | head -n 1)
+  stored_occupancy_schema_version=$(sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
+  stored_occupancy_used_tokens=$(sed -n 's/.*"used_tokens": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
+  stored_occupancy_context_window=$(sed -n 's/.*"context_window": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
+  stored_occupancy_max_turn_burn=$(sed -n 's/.*"max_turn_burn": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
+  stored_occupancy_last_completed_turn_tokens=$(sed -n 's/.*"last_completed_turn_tokens": \(null\|[0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
+  stored_occupancy_projected_usage=$(sed -n 's/.*"projected_usage": \([0-9][0-9]*\).*/\1/p' "$refresh_state_file" | head -n 1)
+  stored_occupancy_would_trigger=$(sed -n 's/.*"would_trigger": \(true\|false\).*/\1/p' "$refresh_state_file" | head -n 1)
+  if [[ -z $stored_occupancy_schema_version ]]; then
+    stored_occupancy_schema_version=$occupancy_state_version
+  fi
+  if [[ -z $stored_occupancy_last_completed_turn_tokens ]]; then
+    stored_occupancy_last_completed_turn_tokens=null
+  fi
 fi
 
 if [[ ! -f $refresh_state_file ]]; then
@@ -183,13 +222,20 @@ if [[ ! -f $refresh_state_file ]]; then
   stored_token_threshold=$default_token_threshold
   stored_token_cursor_b64=""
   stored_log_file_b64=""
+  stored_occupancy_schema_version=$occupancy_state_version
+  stored_occupancy_used_tokens=0
+  stored_occupancy_context_window=0
+  stored_occupancy_max_turn_burn=0
+  stored_occupancy_last_completed_turn_tokens=null
+  stored_occupancy_projected_usage=0
+  stored_occupancy_would_trigger=false
   state_status=" state=initialized"
-elif [[ $stored_session_id == "$refresh_session_id" && $stored_mode == turns && $stored_turn_counter =~ ^[0-9]+$ && $stored_turn_threshold =~ ^[1-9][0-9]*$ ]]; then
+elif [[ $stored_session_id == "$refresh_session_id" && $stored_mode == turns && $stored_turn_counter =~ ^[0-9]+$ && $stored_turn_threshold =~ ^[1-9][0-9]*$ && $stored_occupancy_schema_version == "$occupancy_state_version" && $stored_occupancy_used_tokens =~ ^[0-9]+$ && $stored_occupancy_context_window =~ ^[0-9]+$ && $stored_occupancy_max_turn_burn =~ ^[0-9]+$ && $stored_occupancy_last_completed_turn_tokens =~ ^(null|[0-9]+)$ && $stored_occupancy_projected_usage =~ ^[0-9]+$ && $stored_occupancy_would_trigger =~ ^(true|false)$ ]]; then
   stored_token_counter=0
   stored_token_threshold=$default_token_threshold
   stored_token_cursor_b64=""
   stored_log_file_b64=""
-elif [[ $stored_session_id == "$refresh_session_id" && $stored_mode == tokens && $stored_turn_counter =~ ^[0-9]+$ && $stored_turn_threshold =~ ^[1-9][0-9]*$ && $stored_token_counter =~ ^[0-9]+$ && $stored_token_threshold =~ ^[1-9][0-9]*$ && -n $stored_token_cursor_b64 && -n $stored_log_file_b64 ]]; then
+elif [[ $stored_session_id == "$refresh_session_id" && $stored_mode == tokens && $stored_turn_counter =~ ^[0-9]+$ && $stored_turn_threshold =~ ^[1-9][0-9]*$ && $stored_token_counter =~ ^[0-9]+$ && $stored_token_threshold =~ ^[1-9][0-9]*$ && -n $stored_token_cursor_b64 && -n $stored_log_file_b64 && $stored_occupancy_schema_version == "$occupancy_state_version" && $stored_occupancy_used_tokens =~ ^[0-9]+$ && $stored_occupancy_context_window =~ ^[0-9]+$ && $stored_occupancy_max_turn_burn =~ ^[0-9]+$ && $stored_occupancy_last_completed_turn_tokens =~ ^(null|[0-9]+)$ && $stored_occupancy_projected_usage =~ ^[0-9]+$ && $stored_occupancy_would_trigger =~ ^(true|false)$ ]]; then
   :
 else
   stored_session_id=$refresh_session_id
@@ -200,6 +246,13 @@ else
   stored_token_threshold=$default_token_threshold
   stored_token_cursor_b64=""
   stored_log_file_b64=""
+  stored_occupancy_schema_version=$occupancy_state_version
+  stored_occupancy_used_tokens=0
+  stored_occupancy_context_window=0
+  stored_occupancy_max_turn_burn=0
+  stored_occupancy_last_completed_turn_tokens=null
+  stored_occupancy_projected_usage=0
+  stored_occupancy_would_trigger=false
   state_status=" state=restarted"
 fi
 
@@ -209,6 +262,13 @@ token_counter=$stored_token_counter
 token_threshold=$stored_token_threshold
 token_cursor_b64=$stored_token_cursor_b64
 log_file_b64=$stored_log_file_b64
+occupancy_schema_version=$stored_occupancy_schema_version
+occupancy_used_tokens=$stored_occupancy_used_tokens
+occupancy_context_window=$stored_occupancy_context_window
+occupancy_max_turn_burn=$stored_occupancy_max_turn_burn
+occupancy_last_completed_turn_tokens=$stored_occupancy_last_completed_turn_tokens
+occupancy_projected_usage=$stored_occupancy_projected_usage
+occupancy_would_trigger=$stored_occupancy_would_trigger
 previous_mode=$stored_mode
 
 if [[ $refresh_mode == turns ]]; then
@@ -219,6 +279,7 @@ fi
 
 token_log_file=""
 resolved_log_file_b64=""
+occupancy_scan_completed=false
 
 find_token_log() {
   if [[ -n $token_log_override ]]; then
@@ -281,7 +342,6 @@ find_token_log() {
 
 require_token_helper() {
   if [[ -z $token_helper_file ]]; then
-    script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
     token_helper_file="$script_directory/instruction-refresh-token-count.py"
   fi
   if [[ ! -f $token_helper_file || ! -r $token_helper_file ]]; then
@@ -307,15 +367,34 @@ parse_token_helper_output() {
   helper_event_count=""
   helper_next_cursor_b64=""
   helper_status=""
+  helper_occupancy_schema_version=""
+  helper_occupancy_used_tokens=""
+  helper_occupancy_context_window=""
+  helper_occupancy_max_turn_burn=""
+  helper_occupancy_last_completed_turn_tokens=""
+  helper_occupancy_projected_usage=""
+  helper_occupancy_would_trigger=""
   helper_extra=""
   read -r helper_protocol helper_token_delta helper_event_count \
-    helper_next_cursor_b64 helper_status helper_extra <<<"$helper_output"
+    helper_next_cursor_b64 helper_status helper_occupancy_schema_version \
+    helper_occupancy_used_tokens helper_occupancy_context_window \
+    helper_occupancy_max_turn_burn \
+    helper_occupancy_last_completed_turn_tokens \
+    helper_occupancy_projected_usage helper_occupancy_would_trigger \
+    helper_extra <<<"$helper_output"
 
-  if [[ $helper_protocol != v1 \
+  if [[ $helper_protocol != v3 \
         || ! $helper_token_delta =~ ^[0-9]+$ \
         || ! $helper_event_count =~ ^[0-9]+$ \
         || ! $helper_next_cursor_b64 =~ ^[A-Za-z0-9_-]+={0,2}$ \
         || ! $helper_status =~ ^(anchored|ok|restarted|compacted)$ \
+        || $helper_occupancy_schema_version != "$occupancy_state_version" \
+        || ! $helper_occupancy_used_tokens =~ ^[0-9]+$ \
+        || ! $helper_occupancy_context_window =~ ^[0-9]+$ \
+        || ! $helper_occupancy_max_turn_burn =~ ^[0-9]+$ \
+        || ! $helper_occupancy_last_completed_turn_tokens =~ ^(none|[0-9]+)$ \
+        || ! $helper_occupancy_projected_usage =~ ^[0-9]+$ \
+        || ! $helper_occupancy_would_trigger =~ ^(true|false)$ \
         || -n $helper_extra ]]; then
     echo "error: token helper returned invalid output" >&2
     exit 1
@@ -341,17 +420,42 @@ anchor_token_log() {
     exit 1
   fi
   token_cursor_b64=$helper_next_cursor_b64
+  occupancy_schema_version=$helper_occupancy_schema_version
+  occupancy_used_tokens=$helper_occupancy_used_tokens
+  occupancy_context_window=$helper_occupancy_context_window
+  occupancy_max_turn_burn=$helper_occupancy_max_turn_burn
+  if [[ $helper_occupancy_last_completed_turn_tokens == none ]]; then
+    occupancy_last_completed_turn_tokens=null
+  else
+    occupancy_last_completed_turn_tokens=$helper_occupancy_last_completed_turn_tokens
+  fi
+  occupancy_projected_usage=$helper_occupancy_projected_usage
+  occupancy_would_trigger=$helper_occupancy_would_trigger
 }
 
 scan_token_log() {
   require_token_helper
   helper_output=""
-  if ! helper_output=$(
-    python3 "$token_helper_file" scan \
-      --platform "$refresh_platform" \
-      --log-file "$token_log_file" \
-      --cursor "$token_cursor_b64"
-  ); then
+  helper_command=(
+    python3 "$token_helper_file" scan
+    --platform "$refresh_platform"
+    --log-file "$token_log_file"
+    --cursor "$token_cursor_b64"
+  )
+  if [[ $refresh_platform == codex && $occupancy_context_window -gt 0 ]]; then
+    helper_command+=(
+      --occupancy-used-tokens "$occupancy_used_tokens"
+      --occupancy-context-window "$occupancy_context_window"
+      --occupancy-max-turn-burn "$occupancy_max_turn_burn"
+    )
+    if [[ $occupancy_last_completed_turn_tokens != null ]]; then
+      helper_command+=(
+        --occupancy-last-completed-turn-tokens \
+        "$occupancy_last_completed_turn_tokens"
+      )
+    fi
+  fi
+  if ! helper_output=$("${helper_command[@]}"); then
     exit 1
   fi
   parse_token_helper_output "$helper_output"
@@ -370,6 +474,18 @@ scan_token_log() {
   fi
   token_counter=$((token_counter + helper_token_delta))
   token_cursor_b64=$helper_next_cursor_b64
+  occupancy_schema_version=$helper_occupancy_schema_version
+  occupancy_used_tokens=$helper_occupancy_used_tokens
+  occupancy_context_window=$helper_occupancy_context_window
+  occupancy_max_turn_burn=$helper_occupancy_max_turn_burn
+  if [[ $helper_occupancy_last_completed_turn_tokens == none ]]; then
+    occupancy_last_completed_turn_tokens=null
+  else
+    occupancy_last_completed_turn_tokens=$helper_occupancy_last_completed_turn_tokens
+  fi
+  occupancy_projected_usage=$helper_occupancy_projected_usage
+  occupancy_would_trigger=$helper_occupancy_would_trigger
+  occupancy_scan_completed=true
 }
 
 if $reset_counter; then
@@ -400,6 +516,21 @@ else
       scan_token_log
     fi
   fi
+fi
+
+if $reset_occupancy; then
+  if ! $occupancy_scan_completed; then
+    scan_token_log
+  fi
+  occupancy_max_turn_burn=0
+  occupancy_projected_usage=$occupancy_used_tokens
+  if [[ $occupancy_context_window -gt 0 \
+        && $occupancy_projected_usage -ge $occupancy_context_window ]]; then
+    occupancy_would_trigger=true
+  else
+    occupancy_would_trigger=false
+  fi
+  state_status=" state=occupancy-reset"
 fi
 
 stored_mode=$refresh_mode
@@ -455,11 +586,22 @@ cleanup_temporary_state() {
 trap cleanup_temporary_state EXIT
 
 if [[ $refresh_mode == turns ]]; then
-  printf '{\n  "session_id": "%s",\n  "mode": "turns",\n  "turn_counter": %d,\n  "turn_threshold": %d\n}\n' \
-    "$refresh_session_id" "$turn_counter" "$turn_threshold" >"$temporary_state_file"
+  printf '{\n  "session_id": "%s",\n  "mode": "turns",\n  "turn_counter": %d,\n  "turn_threshold": %d,\n  "context_occupancy": {\n    "schema_version": %d,\n    "used_tokens": %d,\n    "context_window": %d,\n    "max_turn_burn": %d,\n    "last_completed_turn_tokens": %s,\n    "projected_usage": %d,\n    "would_trigger": %s\n  }\n}\n' \
+    "$refresh_session_id" "$turn_counter" "$turn_threshold" \
+    "$occupancy_schema_version" "$occupancy_used_tokens" \
+    "$occupancy_context_window" "$occupancy_max_turn_burn" \
+    "$occupancy_last_completed_turn_tokens" "$occupancy_projected_usage" \
+    "$occupancy_would_trigger" >"$temporary_state_file"
 else
-  printf '{\n  "session_id": "%s",\n  "mode": "tokens",\n  "turn_counter": %d,\n  "turn_threshold": %d,\n  "token_counter": %d,\n  "token_threshold": %d,\n  "token_cursor_b64": "%s",\n  "log_file_b64": "%s"\n}\n' \
-    "$refresh_session_id" "$turn_counter" "$turn_threshold" "$token_counter" "$token_threshold" "$token_cursor_b64" "$log_file_b64" >"$temporary_state_file"
+  printf '{\n  "session_id": "%s",\n  "mode": "tokens",\n  "turn_counter": %d,\n  "turn_threshold": %d,\n  "token_counter": %d,\n  "token_threshold": %d,\n  "token_cursor_b64": "%s",\n  "log_file_b64": "%s",\n  "context_occupancy": {\n    "schema_version": %d,\n    "used_tokens": %d,\n    "context_window": %d,\n    "max_turn_burn": %d,\n    "last_completed_turn_tokens": %s,\n    "projected_usage": %d,\n    "would_trigger": %s\n  }\n}\n' \
+    "$refresh_session_id" "$turn_counter" "$turn_threshold" \
+    "$token_counter" "$token_threshold" "$token_cursor_b64" \
+    "$log_file_b64" "$occupancy_schema_version" \
+    "$occupancy_used_tokens" "$occupancy_context_window" \
+    "$occupancy_max_turn_burn" \
+    "$occupancy_last_completed_turn_tokens" \
+    "$occupancy_projected_usage" "$occupancy_would_trigger" \
+    >"$temporary_state_file"
 fi
 mv -f -- "$temporary_state_file" "$refresh_state_file"
 temporary_state_file=""
@@ -470,6 +612,11 @@ if $show_status || [[ $refresh_completed == yes ]]; then
   else
     echo "turns=$turn_counter/$turn_threshold tokens=$token_counter/$token_threshold trigger=tokens refresh=$refresh_required$state_status"
   fi
+  occupancy_trigger_status=no
+  if [[ $occupancy_would_trigger == true ]]; then
+    occupancy_trigger_status=yes
+  fi
+  echo "context_occupancy schema_version=$occupancy_schema_version used_tokens=$occupancy_used_tokens context_window=$occupancy_context_window max_turn_burn=$occupancy_max_turn_burn last_completed_turn_tokens=$occupancy_last_completed_turn_tokens projected_usage=$occupancy_projected_usage would_trigger=$occupancy_trigger_status"
 fi
 
 if [[ $refresh_completed == yes ]]; then

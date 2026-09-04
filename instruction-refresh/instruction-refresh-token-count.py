@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Platform token-log helper for instruction-refresh-counter.sh.
+"""Platform token-log helper for the instruction-refresh counter.
 
 Command interface:
 
@@ -13,11 +13,14 @@ cursor.
 
 Successful output is exactly one whitespace-delimited line:
 
-    v1 DELTA EVENT_COUNT CURSOR_B64 STATUS
+    v3 DELTA EVENT_COUNT CURSOR_B64 STATUS OCCUPANCY_SCHEMA_VERSION \
+        USED_TOKENS CONTEXT_WINDOW MAX_TURN_BURN \
+        LAST_COMPLETED_TURN_TOKENS PROJECTED_USAGE WOULD_TRIGGER
 
 All fields contain no whitespace. DELTA and EVENT_COUNT are non-negative
 decimal integers. CURSOR_B64 is an opaque URL-safe Base64 value owned by the
-helper. STATUS is one of:
+helper. LAST_COMPLETED_TURN_TOKENS is either a non-negative decimal integer or
+``none``. STATUS is one of:
 
     anchored   anchor completed
     ok         scan completed normally
@@ -35,18 +38,27 @@ state, thresholds, resets, instruction loading, locking, or refresh output.
 import argparse
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 
 
-PROTOCOL_VERSION = "v1"
+PROTOCOL_VERSION = "v3"
 VALID_STATUSES = frozenset({"anchored", "ok", "restarted", "compacted"})
-CURSOR_VERSION = 1
+OCCUPANCY_STATE_VERSION = 1
 SUPPORTED_PLATFORMS = ("codex", "claude")
+CURSOR_VERSIONS = {
+    "codex": 3,
+    "claude": 1,
+}
 CURSOR_FIELDS = {
-    "codex": frozenset({"offset", "device", "inode"}),
+    "codex": frozenset({
+        "offset", "device", "inode", "boundary_digest", "task_active",
+        "pending_sample"
+    }),
     "claude": frozenset({
         "offset", "device", "inode", "last_prompt", "last_message_id"
     }),
@@ -60,6 +72,54 @@ SYNTHETIC_MODEL = "<synthetic>"
 
 class HelperError(Exception):
     """A transcript, cursor, or protocol error safe to show to the caller."""
+
+
+@dataclass(frozen=True)
+class InstructionRefreshScan:
+    delta: int
+    event_count: int
+    cursor: str
+    status: str
+
+
+@dataclass(frozen=True)
+class OccupancyTokenSample:
+    line_number: int
+    used_tokens: int
+    context_window: int
+
+
+@dataclass(frozen=True)
+class ContextOccupancyScan:
+    schema_version: int
+    used_tokens: int
+    context_window: int
+    max_turn_burn: int
+    last_completed_turn_tokens: int | None
+    projected_usage: int
+    would_trigger: bool
+    latest_sample_line: int
+
+    def state_namespace(self):
+        return {
+            "context_occupancy": {
+                "schema_version": self.schema_version,
+                "used_tokens": self.used_tokens,
+                "context_window": self.context_window,
+                "max_turn_burn": self.max_turn_burn,
+                "last_completed_turn_tokens": (
+                    self.last_completed_turn_tokens
+                ),
+                "projected_usage": self.projected_usage,
+                "would_trigger": self.would_trigger,
+            }
+        }
+
+
+@dataclass(frozen=True)
+class CombinedCodexScan:
+    instruction_refresh: InstructionRefreshScan
+    context_occupancy: ContextOccupancyScan
 
 
 def non_negative_integer(value, field, line_number):
@@ -81,7 +141,39 @@ def validate_cursor_fields(platform, fields):
                 f"cursor {field} must be a non-negative integer"
             )
 
-    if platform == "claude":
+    if platform == "codex":
+        boundary_digest = fields["boundary_digest"]
+        if not isinstance(boundary_digest, str) or re.fullmatch(
+                r"[0-9a-f]{64}", boundary_digest) is None:
+            raise HelperError(
+                "cursor boundary_digest must be a SHA-256 hexadecimal digest"
+            )
+        if not isinstance(fields["task_active"], bool):
+            raise HelperError("cursor task_active must be a boolean")
+        pending_sample = fields["pending_sample"]
+        if pending_sample is not None:
+            if not fields["task_active"]:
+                raise HelperError(
+                    "cursor pending_sample requires an active task"
+                )
+            if not isinstance(pending_sample, dict) or set(pending_sample) != {
+                    "used_tokens", "context_window"}:
+                raise HelperError("cursor pending_sample has an invalid schema")
+            used_tokens = pending_sample["used_tokens"]
+            context_window = pending_sample["context_window"]
+            if isinstance(used_tokens, bool) or not isinstance(
+                    used_tokens, int) or used_tokens < 0:
+                raise HelperError(
+                    "cursor pending_sample used_tokens must be a "
+                    "non-negative integer"
+                )
+            if isinstance(context_window, bool) or not isinstance(
+                    context_window, int) or context_window <= 0:
+                raise HelperError(
+                    "cursor pending_sample context_window must be a "
+                    "positive integer"
+                )
+    elif platform == "claude":
         last_prompt = fields["last_prompt"]
         if last_prompt is not None and (
                 isinstance(last_prompt, bool)
@@ -101,7 +193,7 @@ def validate_cursor_fields(platform, fields):
 def encode_cursor(platform, **fields):
     validate_cursor_fields(platform, fields)
     cursor_payload = {
-        "version": CURSOR_VERSION,
+        "version": CURSOR_VERSIONS[platform],
         "platform": platform,
         **fields,
     }
@@ -126,10 +218,10 @@ def decode_cursor(cursor, expected_platform):
             or "version" not in decoded \
             or "platform" not in decoded:
         raise HelperError("cursor has an invalid schema")
-    if decoded["version"] != CURSOR_VERSION:
-        raise HelperError("cursor version is not supported")
     if decoded["platform"] != expected_platform:
         raise HelperError("cursor belongs to another platform")
+    if decoded["version"] != CURSOR_VERSIONS[expected_platform]:
+        raise HelperError("cursor version is not supported")
     fields = {
         key: value for key, value in decoded.items()
         if key not in {"version", "platform"}
@@ -173,14 +265,41 @@ def last_complete_offset(handle, size):
     return 0
 
 
+def codex_boundary_digest(handle, offset):
+    digest_start = max(0, offset - 64)
+    handle.seek(digest_start)
+    boundary = handle.read(offset - digest_start)
+    return hashlib.sha256(boundary).hexdigest()
+
+
+def codex_cursor_continues(handle, log_stat, complete_offset, cursor_state):
+    if cursor_state is None \
+            or cursor_state["device"] != log_stat.st_dev \
+            or cursor_state["inode"] != log_stat.st_ino \
+            or cursor_state["offset"] > complete_offset:
+        return False
+
+    offset = cursor_state["offset"]
+    if offset > 0:
+        handle.seek(offset - 1)
+        if handle.read(1) != b"\n":
+            return False
+    return cursor_state["boundary_digest"] == codex_boundary_digest(
+        handle, offset
+    )
+
+
 def anchor_codex(log_file):
-    with open_log(log_file) as handle:
-        log_stat = os.fstat(handle.fileno())
-        offset = last_complete_offset(handle, log_stat.st_size)
-    return 0, 0, encode_cursor(
-        "codex", offset=offset, device=log_stat.st_dev,
-        inode=log_stat.st_ino
-    ), "anchored"
+    rebuilt = scan_codex(log_file, "")
+    return CombinedCodexScan(
+        instruction_refresh=InstructionRefreshScan(
+            delta=0,
+            event_count=0,
+            cursor=rebuilt.instruction_refresh.cursor,
+            status="anchored",
+        ),
+        context_occupancy=rebuilt.context_occupancy,
+    )
 
 
 def codex_token_event_delta(entry, line_number):
@@ -218,7 +337,42 @@ def codex_token_event_delta(entry, line_number):
     return delta
 
 
-def scan_codex(log_file, cursor):
+def codex_occupancy_sample(entry, line_number):
+    if not isinstance(entry, dict) or entry.get("type") != "event_msg":
+        return None
+
+    payload = entry.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return None
+
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    usage = info.get("last_token_usage")
+    if not isinstance(usage, dict):
+        return None
+
+    used_tokens = usage.get("total_tokens")
+    context_window = info.get("model_context_window")
+    if isinstance(used_tokens, bool) or not isinstance(used_tokens, int) \
+            or used_tokens < 0:
+        return None
+    if isinstance(context_window, bool) or not isinstance(context_window, int) \
+            or context_window <= 0:
+        return None
+
+    return OccupancyTokenSample(
+        line_number=line_number,
+        used_tokens=used_tokens,
+        context_window=context_window,
+    )
+
+
+def scan_codex(
+        log_file, cursor, occupancy_used_tokens=None,
+        occupancy_context_window=None,
+        occupancy_max_turn_burn=0,
+        occupancy_last_completed_turn_tokens=None):
     try:
         cursor_state = decode_cursor(cursor, "codex")
     except HelperError:
@@ -227,53 +381,134 @@ def scan_codex(log_file, cursor):
     with open_log(log_file) as handle:
         log_stat = os.fstat(handle.fileno())
         size = log_stat.st_size
-        if cursor_state is None \
-                or cursor_state["device"] != log_stat.st_dev \
-                or cursor_state["inode"] != log_stat.st_ino \
-                or cursor_state["offset"] > size:
-            new_offset = last_complete_offset(handle, size)
-            return 0, 0, encode_cursor(
-                "codex", offset=new_offset, device=log_stat.st_dev,
-                inode=log_stat.st_ino
-            ), "restarted"
+        complete_offset = last_complete_offset(handle, size)
+        cursor_continues = codex_cursor_continues(
+            handle, log_stat, complete_offset, cursor_state
+        )
+        scan_offset = cursor_state["offset"] if cursor_continues else 0
+        status = "ok" if cursor_continues else "restarted"
+        handle.seek(scan_offset)
+        complete_chunk = handle.read(complete_offset - scan_offset)
+        next_boundary_digest = codex_boundary_digest(handle, complete_offset)
 
-        offset = cursor_state["offset"]
-
-        handle.seek(offset)
-        chunk = handle.read(size - offset)
-
-    complete_end = chunk.rfind(b"\n")
-    if complete_end < 0:
-        return 0, 0, encode_cursor(
-            "codex", offset=offset, device=log_stat.st_dev,
-            inode=log_stat.st_ino
-        ), "ok"
-
-    complete_chunk = chunk[:complete_end + 1]
     delta = 0
     event_count = 0
+    latest_sample = None
+    pending_sample_state = cursor_state["pending_sample"] \
+        if cursor_continues else None
+    pending_turn_sample = (
+        OccupancyTokenSample(
+            line_number=0,
+            used_tokens=pending_sample_state["used_tokens"],
+            context_window=pending_sample_state["context_window"],
+        )
+        if pending_sample_state is not None else None
+    )
+    task_active = cursor_state["task_active"] if cursor_continues else False
+    use_persisted_occupancy = cursor_continues \
+        and occupancy_used_tokens is not None \
+        and occupancy_context_window is not None
+    previous_completed_used_tokens = occupancy_last_completed_turn_tokens \
+        if use_persisted_occupancy else None
+    max_turn_burn = occupancy_max_turn_burn \
+        if use_persisted_occupancy else 0
     for relative_line, raw_line in enumerate(complete_chunk.splitlines(), 1):
         try:
             line = raw_line.decode("utf-8")
             entry = json.loads(line)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            if CODEX_TOKEN_COUNT_MARKER.search(raw_line):
+            if cursor_continues and CODEX_TOKEN_COUNT_MARKER.search(raw_line):
                 raise HelperError(
                     f"token_count record {relative_line} after cursor is not "
                     "valid JSON"
                 ) from exc
             continue
 
-        event_delta = codex_token_event_delta(entry, relative_line)
-        if event_delta is not None:
-            delta += event_delta
-            event_count += 1
+        payload = entry.get("payload") if isinstance(entry, dict) else None
+        payload_type = payload.get("type") \
+            if isinstance(payload, dict) else None
+        if payload_type == "task_started":
+            task_active = True
+            pending_turn_sample = None
 
-    next_offset = offset + complete_end + 1
-    return delta, event_count, encode_cursor(
-        "codex", offset=next_offset, device=log_stat.st_dev,
-        inode=log_stat.st_ino
-    ), "ok"
+        occupancy_sample = codex_occupancy_sample(entry, relative_line)
+        if occupancy_sample is not None:
+            task_active = True
+            latest_sample = occupancy_sample
+            pending_turn_sample = occupancy_sample
+
+        if payload_type == "task_complete":
+            if pending_turn_sample is not None:
+                if previous_completed_used_tokens is not None:
+                    turn_burn = max(
+                        0,
+                        pending_turn_sample.used_tokens
+                        - previous_completed_used_tokens,
+                    )
+                    max_turn_burn = max(max_turn_burn, turn_burn)
+                previous_completed_used_tokens = pending_turn_sample.used_tokens
+            pending_turn_sample = None
+            task_active = False
+
+        if cursor_continues:
+            event_delta = codex_token_event_delta(entry, relative_line)
+            if event_delta is not None:
+                delta += event_delta
+                event_count += 1
+
+    instruction_refresh = InstructionRefreshScan(
+        delta=delta,
+        event_count=event_count,
+        cursor=encode_cursor(
+            "codex", offset=complete_offset,
+            device=log_stat.st_dev,
+            inode=log_stat.st_ino,
+            boundary_digest=next_boundary_digest,
+            task_active=task_active,
+            pending_sample=(
+                {
+                    "used_tokens": pending_turn_sample.used_tokens,
+                    "context_window": pending_turn_sample.context_window,
+                }
+                if pending_turn_sample is not None else None
+            ),
+        ),
+        status=status,
+    )
+    if latest_sample is None:
+        used_tokens = occupancy_used_tokens if use_persisted_occupancy else 0
+        context_window = (
+            occupancy_context_window if use_persisted_occupancy else 0
+        )
+        projected_usage = used_tokens + 2 * max_turn_burn
+        context_occupancy = ContextOccupancyScan(
+            schema_version=OCCUPANCY_STATE_VERSION,
+            used_tokens=used_tokens,
+            context_window=context_window,
+            max_turn_burn=max_turn_burn,
+            last_completed_turn_tokens=previous_completed_used_tokens,
+            projected_usage=projected_usage,
+            would_trigger=(
+                context_window > 0 and projected_usage >= context_window
+            ),
+            latest_sample_line=0,
+        )
+    else:
+        projected_usage = latest_sample.used_tokens + 2 * max_turn_burn
+        context_occupancy = ContextOccupancyScan(
+            schema_version=OCCUPANCY_STATE_VERSION,
+            used_tokens=latest_sample.used_tokens,
+            context_window=latest_sample.context_window,
+            max_turn_burn=max_turn_burn,
+            last_completed_turn_tokens=previous_completed_used_tokens,
+            projected_usage=projected_usage,
+            would_trigger=projected_usage >= latest_sample.context_window,
+            latest_sample_line=latest_sample.line_number,
+        )
+    return CombinedCodexScan(
+        instruction_refresh=instruction_refresh,
+        context_occupancy=context_occupancy,
+    )
 
 
 def claude_response_prompt(entry, last_message_id):
@@ -406,10 +641,33 @@ def scan_claude(log_file, cursor):
     ), status
 
 
-def emit_result(delta, event_count, cursor, status):
+def emit_result(delta, event_count, cursor, status, context_occupancy=None):
     if status not in VALID_STATUSES:
         raise HelperError("internal status is invalid")
-    print(f"{PROTOCOL_VERSION} {delta} {event_count} {cursor} {status}")
+    if context_occupancy is None:
+        context_occupancy = ContextOccupancyScan(
+            schema_version=OCCUPANCY_STATE_VERSION,
+            used_tokens=0,
+            context_window=0,
+            max_turn_burn=0,
+            last_completed_turn_tokens=None,
+            projected_usage=0,
+            would_trigger=False,
+            latest_sample_line=0,
+        )
+    would_trigger = "true" if context_occupancy.would_trigger else "false"
+    last_completed_turn_tokens = context_occupancy.last_completed_turn_tokens
+    if last_completed_turn_tokens is None:
+        last_completed_turn_tokens = "none"
+    print(
+        f"{PROTOCOL_VERSION} {delta} {event_count} {cursor} {status} "
+        f"{context_occupancy.schema_version} "
+        f"{context_occupancy.used_tokens} "
+        f"{context_occupancy.context_window} "
+        f"{context_occupancy.max_turn_burn} "
+        f"{last_completed_turn_tokens} "
+        f"{context_occupancy.projected_usage} {would_trigger}"
+    )
 
 
 def parse_args():
@@ -430,21 +688,75 @@ def parse_args():
     )
     scan_parser.add_argument("--log-file", required=True)
     scan_parser.add_argument("--cursor", required=True)
+    scan_parser.add_argument("--occupancy-used-tokens", type=int)
+    scan_parser.add_argument("--occupancy-context-window", type=int)
+    scan_parser.add_argument("--occupancy-max-turn-burn", type=int)
+    scan_parser.add_argument(
+        "--occupancy-last-completed-turn-tokens", type=int
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     try:
-        if args.platform == "codex" and args.command == "anchor":
-            result = anchor_codex(args.log_file)
-        elif args.platform == "codex":
-            result = scan_codex(args.log_file, args.cursor)
+        if args.command == "scan":
+            occupancy_values = (
+                args.occupancy_used_tokens,
+                args.occupancy_context_window,
+                args.occupancy_max_turn_burn,
+            )
+            if any(value is None for value in occupancy_values) \
+                    and any(value is not None for value in occupancy_values):
+                raise HelperError(
+                    "occupancy used tokens, context window, and max turn burn "
+                    "must be supplied together"
+                )
+            if any(value is not None and value < 0
+                   for value in occupancy_values):
+                raise HelperError(
+                    "occupancy state arguments must be non-negative"
+                )
+            if args.occupancy_context_window == 0:
+                raise HelperError(
+                    "occupancy context window must be positive"
+                )
+            if args.occupancy_last_completed_turn_tokens is not None \
+                    and args.occupancy_last_completed_turn_tokens < 0:
+                raise HelperError(
+                    "last completed turn tokens must be non-negative"
+                )
+        context_occupancy = None
+        if args.platform == "codex":
+            if args.command == "anchor":
+                combined_result = anchor_codex(args.log_file)
+            else:
+                combined_result = scan_codex(
+                    args.log_file,
+                    args.cursor,
+                    occupancy_used_tokens=args.occupancy_used_tokens,
+                    occupancy_context_window=args.occupancy_context_window,
+                    occupancy_max_turn_burn=(
+                        args.occupancy_max_turn_burn
+                        if args.occupancy_max_turn_burn is not None else 0
+                    ),
+                    occupancy_last_completed_turn_tokens=(
+                        args.occupancy_last_completed_turn_tokens
+                    ),
+                )
+            instruction_refresh = combined_result.instruction_refresh
+            context_occupancy = combined_result.context_occupancy
+            result = (
+                instruction_refresh.delta,
+                instruction_refresh.event_count,
+                instruction_refresh.cursor,
+                instruction_refresh.status,
+            )
         elif args.command == "anchor":
             result = anchor_claude(args.log_file)
         else:
             result = scan_claude(args.log_file, args.cursor)
-        emit_result(*result)
+        emit_result(*result, context_occupancy=context_occupancy)
     except HelperError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
