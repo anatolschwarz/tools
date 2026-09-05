@@ -1,0 +1,3 @@
+# No BS
+
+NO OVERSMARTING!!! NO BULLSHIT!!!
